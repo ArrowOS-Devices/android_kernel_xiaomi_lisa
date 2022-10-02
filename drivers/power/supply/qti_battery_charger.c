@@ -2,6 +2,7 @@
 /*
  * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
  * Copyright (C) 2021 XiaoMi, Inc.
+ * Copyright (c) 2021-2022, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #define pr_fmt(fmt)	"BATTERY_CHG: %s: " fmt, __func__
@@ -39,6 +40,7 @@
 #define BC_XM_STATUS_GET		0x50
 #define BC_XM_STATUS_SET		0x51
 #define BC_SET_NOTIFY_REQ		0x04
+#define BC_DISABLE_NOTIFY_REQ		0x05
 #define BC_NOTIFY_IND			0x07
 #define BC_BATTERY_STATUS_GET		0x30
 #define BC_BATTERY_STATUS_SET		0x31
@@ -482,6 +484,7 @@ struct battery_chg_dev {
 	struct delayed_work		charger_debug_info_print_work;
 	/* To track the driver initialization status */
 	bool				initialized;
+	bool				notify_en;
 };
 
 static const int battery_prop_map[BATT_PROP_MAX] = {
@@ -791,8 +794,9 @@ static int write_property_id(struct battery_chg_dev *bcdev,
 	req_msg.hdr.type = MSG_TYPE_REQ_RESP;
 	req_msg.hdr.opcode = pst->opcode_set;
 
-	pr_debug("psy: %s prop_id: %u val: %u\n", pst->psy->desc->name,
-		req_msg.property_id, val);
+	if (pst->psy)
+		pr_debug("psy: %s prop_id: %u val: %u\n", pst->psy->desc->name,
+			req_msg.property_id, val);
 
 	return battery_chg_write(bcdev, &req_msg, sizeof(req_msg));
 }
@@ -809,8 +813,9 @@ static int read_property_id(struct battery_chg_dev *bcdev,
 	req_msg.hdr.type = MSG_TYPE_REQ_RESP;
 	req_msg.hdr.opcode = pst->opcode_get;
 
-	pr_debug("psy: %s prop_id: %u\n", pst->psy->desc->name,
-		req_msg.property_id);
+	if (pst->psy)
+		pr_debug("psy: %s prop_id: %u\n", pst->psy->desc->name,
+			req_msg.property_id);
 
 	return battery_chg_write(bcdev, &req_msg, sizeof(req_msg));
 }
@@ -824,10 +829,30 @@ static int get_property_id(struct psy_state *pst,
 		if (pst->map[i] == prop)
 			return i;
 
-	pr_err("No property id for property %d in psy %s\n", prop,
-		pst->psy->desc->name);
+	if (pst->psy)
+		pr_err("No property id for property %d in psy %s\n", prop,
+			pst->psy->desc->name);
 
 	return -ENOENT;
+}
+
+static void battery_chg_notify_disable(struct battery_chg_dev *bcdev)
+{
+	struct battery_charger_set_notify_msg req_msg = { { 0 } };
+	int rc;
+
+	if (bcdev->notify_en) {
+		/* Send request to disable notification */
+		req_msg.hdr.owner = MSG_OWNER_BC;
+		req_msg.hdr.type = MSG_TYPE_NOTIFY;
+		req_msg.hdr.opcode = BC_DISABLE_NOTIFY_REQ;
+
+		rc = battery_chg_write(bcdev, &req_msg, sizeof(req_msg));
+		if (rc < 0)
+			pr_err("Failed to disable notification rc=%d\n", rc);
+		else
+			bcdev->notify_en = false;
+	}
 }
 
 static void battery_chg_notify_enable(struct battery_chg_dev *bcdev)
@@ -835,14 +860,18 @@ static void battery_chg_notify_enable(struct battery_chg_dev *bcdev)
 	struct battery_charger_set_notify_msg req_msg = { { 0 } };
 	int rc;
 
-	/* Send request to enable notification */
-	req_msg.hdr.owner = MSG_OWNER_BC;
-	req_msg.hdr.type = MSG_TYPE_NOTIFY;
-	req_msg.hdr.opcode = BC_SET_NOTIFY_REQ;
+	if (!bcdev->notify_en) {
+		/* Send request to enable notification */
+		req_msg.hdr.owner = MSG_OWNER_BC;
+		req_msg.hdr.type = MSG_TYPE_NOTIFY;
+		req_msg.hdr.opcode = BC_SET_NOTIFY_REQ;
 
-	rc = battery_chg_write(bcdev, &req_msg, sizeof(req_msg));
-	if (rc < 0)
-		pr_err("Failed to enable notification rc=%d\n", rc);
+		rc = battery_chg_write(bcdev, &req_msg, sizeof(req_msg));
+		if (rc < 0)
+			pr_err("Failed to enable notification rc=%d\n", rc);
+		else
+			bcdev->notify_en = true;
+	}
 }
 
 static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
@@ -854,6 +883,8 @@ static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
 	atomic_set(&bcdev->state, state);
 	if (state == PMIC_GLINK_STATE_UP)
 		schedule_work(&bcdev->subsys_up_work);
+	else if (state == PMIC_GLINK_STATE_DOWN)
+		bcdev->notify_en = false;
 }
 
 /**
@@ -1044,7 +1075,10 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 
 		break;
 	case BC_SET_NOTIFY_REQ:
-		/* Always ACK response for notify request */
+	case BC_DISABLE_NOTIFY_REQ:
+	case BC_SHUTDOWN_NOTIFY:
+	case BC_SHIP_MODE_REQ_SET:
+		/* Always ACK response for notify or ship_mode request */
 		ack_set = true;
 		break;
 	case BC_WLS_FW_CHECK_UPDATE:
@@ -1229,7 +1263,7 @@ static void handle_notification(struct battery_chg_dev *bcdev, void *data,
 		return;
 	}
 
-	pr_err("notification: %#x\n", notify_msg->notification);
+	pr_debug("notification: %#x\n", notify_msg->notification);
 
 	switch (notify_msg->notification) {
 	case BC_BATTERY_STATUS_GET:
@@ -1658,7 +1692,7 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 {
 	int rc;
 //	u32 fcc_ua, prev_fcc_ua;
-	pr_err("set thermal-level: %d num_thermal_levels: %d \n", val, bcdev->num_thermal_levels);
+	pr_info("set thermal-level: %d num_thermal_levels: %d \n", val, bcdev->num_thermal_levels);
 
 	if (!bcdev->num_thermal_levels)
 		return 0;
@@ -4408,7 +4442,7 @@ static void usbpd_request_vdm_cmd(struct battery_chg_dev *bcdev, enum uvdm_state
 	u32 prop_id, val = 0;
 	int rc;
 
-	pr_err("usbpd_request_vdm_cmd:cmd = %d, data = %d\n", cmd, *data);
+	pr_debug("usbpd_request_vdm_cmd:cmd = %d, data = %d\n", cmd, *data);
 	switch (cmd) {
 	case USBPD_UVDM_CHARGER_VERSION:
 		prop_id = XM_PROP_VDM_CMD_CHARGER_VERSION;
@@ -4423,19 +4457,19 @@ static void usbpd_request_vdm_cmd(struct battery_chg_dev *bcdev, enum uvdm_state
 		prop_id = XM_PROP_VDM_CMD_SESSION_SEED;
 		usbpd_sha256_bitswap32(data, USBPD_UVDM_SS_LEN);
 		val = *data;
-		pr_err("SESSION_SEED:data = %d\n", val);
+		pr_debug("SESSION_SEED:data = %d\n", val);
 		break;
 	case USBPD_UVDM_AUTHENTICATION:
 		prop_id = XM_PROP_VDM_CMD_AUTHENTICATION;
 		usbpd_sha256_bitswap32(data, USBPD_UVDM_SS_LEN);
 		val = *data;
-		pr_err("AUTHENTICATION:data = %d\n", val);
+		pr_debug("AUTHENTICATION:data = %d\n", val);
 		break;
 	case USBPD_UVDM_REVERSE_AUTHEN:
                 prop_id = XM_PROP_VDM_CMD_REVERSE_AUTHEN;
                 usbpd_sha256_bitswap32(data, USBPD_UVDM_SS_LEN);
                 val = *data;
-                pr_err("AUTHENTICATION:data = %d\n", val);
+                pr_debug("AUTHENTICATION:data = %d\n", val);
                 break;
 	case USBPD_UVDM_REMOVE_COMPENSATION:
 		prop_id = XM_PROP_VDM_CMD_REMOVE_COMPENSATION;
@@ -4472,7 +4506,7 @@ static ssize_t request_vdm_cmd_store(struct class *c,
 
 	ret = sscanf(buf, "%d,%s\n", &cmd, buffer);
 
-	pr_info("%s:buf:%s cmd:%d, buffer:%s\n", __func__, buf, cmd, buffer);
+	pr_debug("%s:buf:%s cmd:%d, buffer:%s\n", __func__, buf, cmd, buffer);
 
 	StringToHex(buffer, data, &ccount);
 	usbpd_request_vdm_cmd(bcdev, cmd, (unsigned int *)data);
@@ -4496,7 +4530,7 @@ static ssize_t request_vdm_cmd_show(struct class *c,
 		return rc;
 
 	cmd = pst->prop[XM_PROP_UVDM_STATE];
-	pr_info("request_vdm_cmd_show  uvdm_state: %d\n", cmd);
+	pr_debug("request_vdm_cmd_show  uvdm_state: %d\n", cmd);
 
 	switch (cmd){
 	  case USBPD_UVDM_CHARGER_VERSION:
@@ -4527,7 +4561,7 @@ static ssize_t request_vdm_cmd_show(struct class *c,
 		rc = read_ss_auth_property_id(bcdev, pst, prop_id);
 		if (rc < 0)
 			return rc;
-		pr_info("auth:0x%x 0x%x 0x%x 0x%x\n",
+		pr_debug("auth:0x%x 0x%x 0x%x 0x%x\n",
 			bcdev->ss_auth_data[0],bcdev->ss_auth_data[1],bcdev->ss_auth_data[2],bcdev->ss_auth_data[3]);
 		for (i = 0; i < USBPD_UVDM_SS_LEN; i++) {
 			memset(data, 0, sizeof(data));
@@ -5349,6 +5383,7 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 	return;
 }
 
+#ifdef DEBUG
 #define CHARGING_PERIOD_S		30
 #define DISCHARGE_PERIOD_S		300
 static void xm_charger_debug_info_print_work(struct work_struct *work)
@@ -5393,6 +5428,7 @@ static void xm_charger_debug_info_print_work(struct work_struct *work)
 
 	schedule_delayed_work(&bcdev->charger_debug_info_print_work, interval * HZ);
 }
+#endif
 
 static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 {
@@ -5480,13 +5516,15 @@ static int fb_notifier_callback(struct notifier_block *nb,
 
 	if (evdata && evdata->data && bcdev) {
 		blank = *(int *)(evdata->data);
-		pr_err("val:%lu,blank:%u\n", val, blank);
+		pr_debug("val:%lu,blank:%u\n", val, blank);
 
 		if ((blank == MI_DISP_DPMS_POWERDOWN ||
 			blank == MI_DISP_DPMS_LP1 || blank == MI_DISP_DPMS_LP2)) {
 			bcdev->blank_state = FB_BLANK;
+			battery_chg_notify_disable(bcdev);
 		} else if (blank == MI_DISP_DPMS_ON) {
 			bcdev->blank_state = FB_UNBLANK;
+			battery_chg_notify_enable(bcdev);
 		}
 
 		schedule_work(&bcdev->fb_notifier_work);
@@ -5652,6 +5690,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	}
 
 	battery_chg_add_debugfs(bcdev);
+	bcdev->notify_en = false;
 	battery_chg_notify_enable(bcdev);
 	device_init_wakeup(bcdev->dev, true);
 	rc = register_extcon_conn_type(bcdev);
@@ -5670,8 +5709,11 @@ static int battery_chg_probe(struct platform_device *pdev)
 	schedule_work(&bcdev->usb_type_work);
 
 	INIT_DELAYED_WORK( &bcdev->xm_prop_change_work, generate_xm_charge_uvent);
+
+#ifdef DEBUG
 	INIT_DELAYED_WORK( &bcdev->charger_debug_info_print_work, xm_charger_debug_info_print_work);
 	schedule_delayed_work(&bcdev->charger_debug_info_print_work, 5 * HZ);
+#endif
 
 	bcdev->slave_fg_verify_flag = false;
 	bcdev->shutdown_delay_en = true;
@@ -5716,7 +5758,7 @@ static int chg_suspend(struct device *dev)
 {
 	//struct battery_chg_dev *bcdev = dev_get_drvdata(dev);
 
-	pr_err("chg suspend\n");
+	pr_debug("chg suspend\n");
 	return 0;
 }
 
@@ -5724,7 +5766,7 @@ static int chg_resume(struct device *dev)
 {
 	//struct battery_chg_dev *bcdev = dev_get_drvdata(dev);
 
-	pr_err("chg resume\n");
+	pr_debug("chg resume\n");
 	return 0;
 }
 static const struct of_device_id battery_chg_match_table[] = {
