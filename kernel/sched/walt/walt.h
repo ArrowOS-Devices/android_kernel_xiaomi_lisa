@@ -19,6 +19,7 @@ extern cpumask_t __read_mostly **cpu_array;
 extern void
 walt_update_task_ravg(struct task_struct *p, struct rq *rq, int event,
 						u64 wallclock, u64 irqtime);
+extern u64 walt_get_prev_group_run_sum(struct rq *rq);
 
 static inline void
 fixup_cumulative_runnable_avg(struct walt_sched_stats *stats,
@@ -99,10 +100,6 @@ static inline void dec_rq_walt_stats(struct rq *rq, struct task_struct *p)
 }
 
 extern void fixup_busy_time(struct task_struct *p, int new_cpu);
-extern void walt_prepare_migrate(struct task_struct *p,
-		int src_cpu, int new_cpu, bool locked);
-extern void walt_finish_migrate(struct task_struct *p,
-		int src_cpu, int new_cpu, bool locked);
 extern void init_new_task_load(struct task_struct *p);
 extern void mark_task_starting(struct task_struct *p);
 extern void set_window_start(struct rq *rq);
@@ -233,10 +230,6 @@ static inline void walt_dec_cumulative_runnable_avg(struct rq *rq,
 }
 
 static inline void fixup_busy_time(struct task_struct *p, int new_cpu) { }
-static inline void walt_prepare_migrate(struct task_struct *p,
-		int src_cpu, int new_cpu, bool locked) { }
-static inline void walt_finish_migrate(struct task_struct *p,
-		int src_cpu, int new_cpu, bool locked) { }
 static inline void init_new_task_load(struct task_struct *p)
 {
 }

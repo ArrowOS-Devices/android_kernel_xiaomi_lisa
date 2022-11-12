@@ -8504,10 +8504,13 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
 	lockdep_assert_held(&env->src_rq->lock);
 
 	deactivate_task(env->src_rq, p, DEQUEUE_NOCLOCK);
+	lockdep_off();
+	double_lock_balance(env->src_rq, env->dst_rq);
 	if (!(env->src_rq->clock_update_flags & RQCF_UPDATED))
 		update_rq_clock(env->src_rq);
-	walt_prepare_migrate(p, env->src_cpu, env->dst_cpu, true);
 	set_task_cpu(p, env->dst_cpu);
+	double_unlock_balance(env->src_rq, env->dst_rq);
+	lockdep_on();
 }
 
 /*
@@ -8615,24 +8618,23 @@ redo:
 		if (sched_feat(LB_MIN) && load < 16 && !env->sd->nr_balance_failed)
 			goto next;
 
-
 		if (env->idle != CPU_NEWLY_IDLE) {
-		/*
-		 * p is not running task when we goes until here, so if p is one
-		 * of the 2 task in src cpu rq and not the running one,
-		 * that means it is the only task that can be balanced.
-		 * So only when there is other tasks can be balanced or
-		 * there is situation to ignore big task, it is needed
-		 * to skip the task load bigger than 2*imbalance.
-		 *
-		 * And load based checks are skipped for prefer_spread in
-		 * finding busiest group, ignore the task's h_load.
-		 */
-		if (!env->prefer_spread &&
-			((cpu_rq(env->src_cpu)->nr_running > 2) ||
-			(env->flags & LBF_IGNORE_BIG_TASKS)) &&
-			((load / 2) > env->imbalance))
-			goto next;
+			/*
+			 * p is not running task when we goes until here, so if p is one
+			 * of the 2 task in src cpu rq and not the running one,
+			 * that means it is the only task that can be balanced.
+			 * So only when there is other tasks can be balanced or
+			 * there is situation to ignore big task, it is needed
+			 * to skip the task load bigger than 2*imbalance.
+			 *
+			 * And load based checks are skipped for prefer_spread in
+			 * finding busiest group, ignore the task's h_load.
+			 */
+			if (!env->prefer_spread &&
+				((cpu_rq(env->src_cpu)->nr_running > 2) ||
+					(env->flags & LBF_IGNORE_BIG_TASKS)) &&
+				((load / 2) > env->imbalance))
+				goto next;
 		}
 
 		detach_task(p, env);
@@ -8690,13 +8692,11 @@ next:
 /*
  * attach_task() -- attach the task detached by detach_task() to its new rq.
  */
-static void attach_task(struct rq *rq,
-	struct task_struct *p, struct lb_env *env)
+static void attach_task(struct rq *rq, struct task_struct *p)
 {
 	lockdep_assert_held(&rq->lock);
 
 	BUG_ON(task_rq(p) != rq);
-	walt_finish_migrate(p, env->src_cpu, env->dst_cpu, true);
 	activate_task(rq, p, ENQUEUE_NOCLOCK);
 	check_preempt_curr(rq, p, 0);
 }
@@ -8705,14 +8705,13 @@ static void attach_task(struct rq *rq,
  * attach_one_task() -- attaches the task returned from detach_one_task() to
  * its new rq.
  */
-static void attach_one_task(struct rq *rq,
-	struct task_struct *p, struct lb_env *env)
+static void attach_one_task(struct rq *rq, struct task_struct *p)
 {
 	struct rq_flags rf;
 
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
-	attach_task(rq, p, env);
+	attach_task(rq, p);
 	update_overutilized_status(rq);
 	rq_unlock(rq, &rf);
 }
@@ -8721,22 +8720,20 @@ static void attach_one_task(struct rq *rq,
  * attach_tasks() -- attaches all tasks detached by detach_tasks() to their
  * new rq.
  */
-static void attach_tasks(struct lb_env *env, bool dst_locked)
+static void attach_tasks(struct lb_env *env)
 {
 	struct list_head *tasks = &env->tasks;
 	struct task_struct *p;
 	struct rq_flags rf;
 
-	if (!dst_locked)
-		rq_lock(env->dst_rq, &rf);
-
+	rq_lock(env->dst_rq, &rf);
 	update_rq_clock(env->dst_rq);
 
 	while (!list_empty(tasks)) {
 		p = list_first_entry(tasks, struct task_struct, se.group_node);
 		list_del_init(&p->se.group_node);
 
-		attach_task(env->dst_rq, p, env);
+		attach_task(env->dst_rq, p);
 	}
 
 	/*
@@ -8746,8 +8743,7 @@ static void attach_tasks(struct lb_env *env, bool dst_locked)
 	 * overutilized status here at the end.
 	 */
 	update_overutilized_status(env->dst_rq);
-	if (!dst_locked)
-		rq_unlock(env->dst_rq, &rf);
+	rq_unlock(env->dst_rq, &rf);
 }
 
 #ifdef CONFIG_NO_HZ_COMMON
@@ -10469,15 +10465,6 @@ more_balance:
 		 * ld_moved     - cumulative load moved across iterations
 		 */
 		cur_ld_moved = detach_tasks(&env);
-		if (cur_ld_moved) {
-			if (same_freq_domain(env.src_cpu, env.dst_cpu))
-				/*
-				 * If we move tasks within the same freq domain, it is
-				 * important to acquire dst_rq before releasing src_rq
-				 * to prevent potential load drop.
-				 */
-				double_lock_balance(env.src_rq, env.dst_rq);
-		}
 
 		/*
 		 * We've detached some tasks from busiest_rq. Every
@@ -10490,13 +10477,7 @@ more_balance:
 		rq_unlock(busiest, &rf);
 
 		if (cur_ld_moved) {
-			if (same_freq_domain(env.src_cpu, env.dst_cpu)) {
-				attach_tasks(&env, true);
-				raw_spin_unlock(&env.dst_rq->lock);
-			} else {
-				attach_tasks(&env, false);
-			}
-
+			attach_tasks(&env);
 			ld_moved += cur_ld_moved;
 		}
 
@@ -10795,7 +10776,6 @@ int active_load_balance_cpu_stop(void *data)
 #ifdef CONFIG_SCHED_WALT
 	struct task_struct *push_task;
 	int push_task_detached = 0;
-#endif
 	struct lb_env env = {
 		.sd                     = sd,
 		.dst_cpu                = target_cpu,
@@ -10806,6 +10786,7 @@ int active_load_balance_cpu_stop(void *data)
 		.flags                  = 0,
 		.loop                   = 0,
 	};
+#endif
 
 	rq_lock_irq(busiest_rq, &rf);
 	/*
@@ -10904,13 +10885,13 @@ out_unlock:
 #ifdef CONFIG_SCHED_WALT
 	if (push_task) {
 		if (push_task_detached)
-			attach_one_task(target_rq, push_task, &env);
+			attach_one_task(target_rq, push_task);
 		put_task_struct(push_task);
 	}
 #endif
 
 	if (p)
-		attach_one_task(target_rq, p, &env);
+		attach_one_task(target_rq, p);
 
 	local_irq_enable();
 
@@ -11255,7 +11236,6 @@ static void nohz_balancer_kick(struct rq *rq)
 			flags = NOHZ_KICK_MASK;
 		goto out;
 	}
-
 
 	if (unlikely(per_cpu(nr_pinned_tasks, rq->cpu) > 0)) {
 		int delta = rq->nr_running - per_cpu(nr_pinned_tasks, rq->cpu);
